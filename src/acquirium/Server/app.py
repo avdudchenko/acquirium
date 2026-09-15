@@ -642,12 +642,12 @@ def get_timeseries(
     value_mode: str = "default",
     ):
     try:
-        log.debug(f'/timesries got request for {uri}')
         if order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
     
         start_dt = _parse_dt(start)
         end_dt = _parse_dt(end)
+
         batches: Iterator[pa.RecordBatch] = app.state.manager.timeseries_batch(
             uri=uri,
             start=start_dt,
@@ -657,11 +657,10 @@ def get_timeseries(
             batch_size=request.app.state.read_batch_size,
             value_mode=value_mode,
         )
-        
+
         accept = request.headers.get("accept", "")
 
         def arrow_stream() -> Iterator[bytes]:
-            log.debug(f'/timeseries sending stream for {uri}')
             buf = io.BytesIO()
             writer: ipc.RecordBatchStreamWriter | None = None
             try:
@@ -685,15 +684,14 @@ def get_timeseries(
                 if writer is not None:
                     writer.close()
             data = buf.getvalue()
-            log.debug(f'/timeseries done stream for {uri}')
             if data:
                 yield data
-        
-        log.debug(f'/timeseries starting stream result for {uri}')
+
         return StreamingResponse(
             arrow_stream(),
             media_type="application/vnd.apache.arrow.stream",
         )
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
