@@ -31,7 +31,7 @@ def configure_logging(verbose: bool | None = None) -> None:
     if verbose is None:
         verbose = os.environ.get("ACQUIRIUM_VERBOSE") == "1"
 
-    level = logging.DEBUG if verbose else logging.INFO
+    level = logging.DEBUG# if verbose else logging.INFO
 
     # Root stays at INFO even in verbose mode: third-party libraries
     # (watertap/idaes/pyomo solvers, ...) propagate to root, and their DEBUG

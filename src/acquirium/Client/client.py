@@ -24,7 +24,8 @@ from rdflib import Graph, URIRef, Literal
 from rdflib.namespace import NamespaceManager, RDF, RDFS
 import logging
 logger = logging.getLogger(__name__)
-
+from acquirium.internals._log import configure_logging
+configure_logging()
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -312,15 +313,20 @@ class AcquiriumClient:
             "value_mode": value_mode,
         }
         headers = {"Accept": "application/vnd.apache.arrow.stream"}
-
+        logger.debug(f"sending responce {uri}")
         with requests.get(url, params=params, headers=headers, stream=True, timeout=timeout) as r:
             r.raise_for_status()
-
+            logger.debug(f"got responce {uri}")
             try:
                 # r.raw is a file-like object
                 reader = ipc.RecordBatchStreamReader(r.raw)
                 # Collect all batches into a single table
                 tables = [pl.from_arrow(batch) for batch in reader]
+                
+                if tables:
+                    pl.concat(tables)
+                else:
+                    pl.DataFrame()
                 if tables:
                     return pl.concat(tables)
                 else:

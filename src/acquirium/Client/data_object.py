@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, TYPE_CHECKING
 import polars as pl
 import logging
-
+import time
 if TYPE_CHECKING:
     from acquirium.Client.explore.core import Query
     from acquirium.Client.query_graph import QueryGraph
@@ -347,29 +347,32 @@ class DataObject:
 
         if not getattr(qg, "data_nodes", None):
             return cls._empty(qg, cast_value=cast_value, client=query.client)
-
+        ts=time.time()
         point_ref_uris, entity_context, prop_units, ext_ref_units, point_labels = _parse_sparql_bindings(
             query,
             include_dependencies=include_dependencies,
         )
-
+        print('parse_sparql_bindings', time.time()-ts)
         if not point_ref_uris:
             return cls._empty(qg, cast_value=cast_value, client=query.client)
-
+        ts=time.time()
         # Determine all entity column names across every context dict
         all_entity_cols: set[str] = set()
         for ctx_list in entity_context.values():
             for ctx in ctx_list:
                 all_entity_cols.update(ctx.keys())
         entity_columns = sorted(all_entity_cols)
-
+        print('all_entery',time.time()-ts)
         # Fetch stats for all ref_uris in one batch request
+        ts=time.time()
         ref_uris = list({ref_uri for _, _, ref_uri in point_ref_uris})
         stats = query.client.timeseries_info_batch(ref_uris)
-
+        
+        print('ref_uris',time.time()-ts)
         # Build BindingInfo for each binding
         bindings: list[BindingInfo] = []
         for nid, point_uri, ref_uri in point_ref_uris:
+            ts=time.time()
             alias = qg.aliases_reverse.get(nid, str(nid))
             key = (nid, point_uri, ref_uri)
             contexts = entity_context.get(key, [{}])
@@ -388,8 +391,8 @@ class DataObject:
                 ref_unit=ext_ref_units.get(key),
                 point_label=point_labels.get(key),
             ))
-
-        return cls(
+            print('BindingInfo',nid, time.time()-ts)
+        query_object_clone= cls(
             _bindings=bindings,
             _entity_columns=entity_columns,
             _query_graph=qg,
@@ -405,6 +408,8 @@ class DataObject:
             _tall=None,
             _materialized=False,
         )
+            
+        return query_object_clone
 
     # ------------------------------------------------------------------
     # Materialization
@@ -459,7 +464,8 @@ class DataObject:
             return
 
         cast_value = self._query_params.get("cast_value", "float")
-
+        import time
+        t=time.time()
         if not self._bindings:
             self._tall = pl.DataFrame(
                 schema={
@@ -482,7 +488,8 @@ class DataObject:
 
         # Pre-compute effective units per alias for Case 3.2/3.2.1
         effective_units = self._resolve_effective_units()
-
+        print('initCals', time.time()-t)
+        t=time.time()
         # Cache conversion factors to avoid repeated server calls
         _factors_cache: dict[tuple[str, str], dict] = {}
 
@@ -491,7 +498,8 @@ class DataObject:
             if key not in _factors_cache:
                 _factors_cache[key] = self._client.get_conversion_factors(from_u, to_u)
             return _factors_cache[key]
-
+        print('cfactors', time.time()-t)
+        t=time.time()
         frames: list[pl.DataFrame] = []
         for binding in self._bindings:
             df = self._client.timeseries_df(
@@ -502,6 +510,10 @@ class DataObject:
                 order=order,
                 value_mode=value_mode,
             )
+            
+            print('_client.timeseries_df', time.time()-t)
+            
+            t=time.time()
             if df.is_empty():
                 continue
 
@@ -523,7 +535,10 @@ class DataObject:
             # Drop the ref_uri from timeseries (use the one from SPARQL)
             df = df.drop("ref_uri")
             df = df.with_columns(pl.lit(binding.ref_uri).alias("ref_uri"))
-
+            
+            print('with_columns', time.time()-t)
+            
+            t=time.time()
             # --- Case 3 auto-conversion ---
             target_unit = effective_units.get(binding.alias)
             if binding.ref_unit and target_unit and binding.ref_unit != target_unit:
@@ -545,7 +560,9 @@ class DataObject:
                         "DataObject: auto-conversion failed for ref %s (%s -> %s)",
                         binding.ref_uri, binding.ref_unit, target_unit,
                     )
-
+            print('binding.ref_unit', time.time()-t)
+            
+            t=time.time()
             # Resolve entity columns for this data key
             if len(binding.entity_contexts) <= 1:
                 ctx = binding.entity_contexts[0] if binding.entity_contexts else {}
@@ -558,7 +575,10 @@ class DataObject:
                     for ec in self._entity_columns:
                         df_copy = df_copy.with_columns(pl.lit(ctx.get(ec)).alias(ec))
                     frames.append(df_copy)
-
+            print('binding.entity_contexts', time.time()-t)            
+            t=time.time()
+        print('binding', time.time()-t)
+        t=time.time()
         if not frames:
             schema: dict[str, Any] = {
                 "data_alias": pl.Utf8,
@@ -572,10 +592,13 @@ class DataObject:
                 schema[ec] = pl.Utf8
             self._tall = pl.DataFrame(schema=schema)
             self._materialized = True
+            print('schena', time.time()-t)
+            t=time.time()
             return
-
         tall = pl.concat([_split_value_column(df) for df in frames], how="vertical")
-
+        
+        print('tall', time.time()-t)
+        t=time.time()
         # Apply pending conversions (from convert_to() on a lazy DataObject)
         for alias_pat, from_unit, to_unit in self._pending_conversions:
             try:
@@ -598,7 +621,9 @@ class DataObject:
                     "DataObject: pending conversion failed %s -> %s for alias '%s'",
                     from_unit, to_unit, alias_pat,
                 )
-
+        
+        print('alias_pat', time.time()-t)
+        t=time.time()
         # Reorder columns for consistency
         base_cols = ["data_alias", "point_uri", "ref_uri"] + self._entity_columns + ["time", "value_numeric", "value_text"]
         existing = [c for c in base_cols if c in tall.columns]
