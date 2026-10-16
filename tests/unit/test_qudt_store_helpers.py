@@ -28,35 +28,68 @@ class TestSplitLocalName:
 
 
 class TestBuildSurfaces:
-    def test_labels_only(self):
-        result = _build_surfaces("http://qudt.org/vocab/unit/Kelvin", ["Kelvin", "kelvin"], None, None)
-        assert "kelvin" in result
+    KELVIN = "http://qudt.org/vocab/unit/Kelvin"
 
-    def test_with_symbol_and_ucum(self):
-        result = _build_surfaces("http://qudt.org/vocab/unit/Kelvin", ["Kelvin"], "K", "K")
-        assert "kelvin" in result
-        assert "K" in result
+    def test_labels_only(self):
+        surfaces, exact = _build_surfaces(self.KELVIN, ["Kelvin", "kelvin"], None, None, True)
+        assert "kelvin" in surfaces
+        assert exact == []
+
+    def test_unit_symbol_and_ucum_are_exact_only(self):
+        surfaces, exact = _build_surfaces(self.KELVIN, ["Kelvin"], "K", "K", True)
+        assert surfaces == ["kelvin"]
+        assert exact == ["K"]
+
+    def test_unit_local_name_is_exact_only_when_there_is_a_label(self):
+        surfaces, exact = _build_surfaces(
+            "http://qudt.org/vocab/unit/GAL_US-PER-MIN", ["US Gallon per Minute"], None, None, True
+        )
+        assert surfaces == ["us gallon per minute"]
+        assert exact == ["gal us per min"]
+
+    def test_quantity_kind_local_name_stays_embedded(self):
+        surfaces, exact = _build_surfaces(
+            "http://qudt.org/vocab/quantitykind/VolumeFlowRate", ["Volume Flow Rate"], None, None, False
+        )
+        assert surfaces == ["volume flow rate"] and exact == []
+        surfaces, _ = _build_surfaces(
+            "http://qudt.org/vocab/quantitykind/VolumeFlowRate", ["Volumetric Flow"], None, None, False
+        )
+        assert surfaces == ["volumetric flow", "volume flow rate"]
+
+    def test_quantity_kind_symbol_is_not_a_surface(self):
+        surfaces, exact = _build_surfaces(
+            "http://qudt.org/vocab/quantitykind/Temperature", ["Temperature"], "T", "T", False
+        )
+        assert surfaces == ["temperature"]
+        assert exact == []
 
     def test_deduplication(self):
-        result = _build_surfaces("http://qudt.org/vocab/unit/Meter", ["meter", "meter"], "m", None)
-        assert result.count("meter") == 1
+        surfaces, _ = _build_surfaces("http://qudt.org/vocab/unit/Meter", ["meter", "meter"], "m", None, True)
+        assert surfaces.count("meter") == 1
 
     def test_empty_labels_uses_local_name(self):
-        result = _build_surfaces("http://qudt.org/vocab/unit/MilliLiter", [], None, None)
-        assert len(result) >= 1
-        assert any("milli" in s for s in result)
+        surfaces, _ = _build_surfaces("http://qudt.org/vocab/unit/MilliLiter", [], None, None, True)
+        assert len(surfaces) >= 1
+        assert any("milli" in s for s in surfaces)
 
     def test_all_empty(self):
         # URI with no meaningful local name
-        result = _build_surfaces("", [], None, None)
-        assert result == []
+        assert _build_surfaces("", [], None, None, True) == ([], [])
 
-    def test_symbol_preserved_case(self):
-        result = _build_surfaces("http://qudt.org/vocab/unit/DegreeCelsius", [], "degC", None)
-        assert "degC" in result
+    def test_symbol_is_embedded_when_it_is_the_only_surface(self):
+        # nothing else to embed: the concept must keep a vector
+        surfaces, exact = _build_surfaces("", [], "degC", None, True)
+        assert surfaces == ["degC"]
+        assert exact == []
+
+    def test_unit_without_a_label_embeds_its_local_name(self):
+        surfaces, exact = _build_surfaces("http://qudt.org/vocab/unit/DegreeCelsius", [], "degC", None, True)
+        assert surfaces == ["degree celsius"]
+        assert exact == ["degC"]  # case preserved
 
 
-# ── QUDTStore.extract_concepts (graph-fed) ─────────────────
+# ── QUDTStore.extract_concepts (query-fed) ─────────────────
 
 
 class TestExtractConcepts:
@@ -79,23 +112,42 @@ class TestExtractConcepts:
         )
         return g
 
+    def _extract(self, rdf_type):
+        rows = self._graph().query(QUDTStore.concept_query(rdf_type))
+        values = [tuple(None if cell is None else str(cell) for cell in row) for row in rows]
+        return QUDTStore.extract_concepts(values, rdf_type)
+
     def test_unit_extraction(self):
-        c = QUDTStore.extract_concepts(
-            self._graph(), "http://qudt.org/schema/qudt/Unit"
-        )
+        c = self._extract("http://qudt.org/schema/qudt/Unit")
         assert len(c) == 1
         u = c[0]
         assert u["uri"] == "http://qudt.org/vocab/unit/KiloGM"
         assert u["kind"] == "unit"
-        assert "kg" in u["surfaces"] and "kilogram" in u["surfaces"]
+        assert "kilogram" in u["surfaces"]
+        assert u["exact_surfaces"] == ["kilo gm", "kg"]
         assert u["related"] == ["http://qudt.org/vocab/quantitykind/Mass"]
 
     def test_quantity_kind_extraction(self):
-        c = QUDTStore.extract_concepts(
-            self._graph(), "http://qudt.org/schema/qudt/QuantityKind"
-        )
+        c = self._extract("http://qudt.org/schema/qudt/QuantityKind")
         assert [x["uri"] for x in c] == [
             "http://qudt.org/vocab/quantitykind/Mass"
         ]
         assert c[0]["kind"] == "quantity_kind"
         assert c[0]["related"] == ["http://qudt.org/vocab/unit/KiloGM"]
+
+    def test_label_rules_and_bare_subjects(self):
+        unit = "http://qudt.org/schema/qudt/Unit"
+        label = "http://www.w3.org/2000/01/rdf-schema#label"
+        alt = "http://www.w3.org/2004/02/skos/core#altLabel"
+        rows = [
+            ("http://ex.org/u/B", label, "Zeta", ""),
+            ("http://ex.org/u/B", label, "Alpha", "en-US"),
+            ("http://ex.org/u/B", label, "Kilogramm", "de"),
+            ("http://ex.org/u/B", alt, "Alpha", None),
+            ("http://ex.org/u/A-Bare", None, None, None),
+        ]
+        a, b = QUDTStore.extract_concepts(rows, unit)
+        assert a["uri"] == "http://ex.org/u/A-Bare" and a["label"] == "a bare"
+        assert b["label"] == "Alpha"
+        assert b["surfaces"][:2] == ["alpha", "zeta"]
+        assert "kilogramm" not in b["surfaces"]

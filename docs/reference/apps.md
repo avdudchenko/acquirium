@@ -159,11 +159,15 @@ Match columns use query aliases. A stream alias holds its point URI, with
 entities appear under their own aliases. Internal work cursor fields are
 reserved for runtime bookkeeping.
 
-When the query's match table changes, the runtime schedules a repair of the
-retained output. This includes changes to the sensors in a named aggregate
-and to the full query result available to per-match apps. The runtime persists
-a fingerprint of that context so it can detect changes across restarts.
-Changing the app's code alone still requires explicit reprocessing.
+When a replan changes what a binding depends on, the runtime schedules a
+repair of its retained output. A per-match binding depends on its own match
+row: its entity, streams, labels and units. An all-matches binding depends
+on the whole match table, so adding or removing a sensor repairs the
+aggregate. A change to other rows of the fleet does not re-run a per-match
+binding, so `result` in a per-match call describes the fleet as of that
+call. The runtime persists a fingerprint of each binding's context so it can
+detect changes across restarts. Changing the app's code alone still requires
+explicit reprocessing.
 
 ## TimeWindow
 
@@ -209,6 +213,12 @@ incomplete rows according to the calculation's requirements.
   runs on the server and returns per-binding inputs, windows, outputs, and errors.
 - `acquirium app check module:Class --local` executes in the caller's process.
   Local failures raise with their traceback; server failures appear in results.
+- `aq.console(banner=None, depth=1)` opens an interactive console containing
+  the caller's globals and locals. Ctrl-D or `exit()` resumes execution.
+  Rebinding a name changes only the console snapshot, while mutating a shared
+  object is visible to the app. Without an interactive stdin it logs a warning
+  and returns; run checks with `--local` to use it. `depth` selects an outer
+  caller frame for wrapper helpers.
 - `client.deploy_app(AppClass, parameters=None)` validates before activating.
 - `client.list_apps()` returns `{"ok": true, "apps": [...]}` with every
   deployment's name, entrypoint, grouping, status, binding count and status

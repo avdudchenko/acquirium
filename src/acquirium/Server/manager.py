@@ -16,6 +16,7 @@ from acquirium.Storage import (
     TimeseriesStore,
     create_timeseries_store,
 )
+from acquirium.Storage.graph_store import select_values
 from acquirium.Storage.publication.types import PublicationReceipt, PublicationRequest, PublicationStore
 from acquirium.Storage.values import normalize_value_kind
 from acquirium.internals.qudt_units import QUDTUnitConverter
@@ -23,14 +24,16 @@ from acquirium.Server.config import OntologySource
 from acquirium.internals.models import LogEntry, Order, TimeIntervalModel, compute_ref_uri
 from acquirium.internals.internals_namespaces import *
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
     import pyarrow as pa
 import shutil
-from acquirium.TextMatch.embedding_matcher import EmbeddingMatcher, _split_local_name
+from acquirium.TextMatch.embedding_matcher import DEFAULT_MODEL, EmbeddingMatcher
+from acquirium.TextMatch.graph_concepts import GraphConcepts
 from acquirium.TextMatch.qudt_store import QUDTStore
 from acquirium.TextMatch.resolver import ConceptResolver
+from acquirium.TextMatch.unit_key import UnitKeyIndex
 
 from acquirium.internals._log import timed_debug
 
@@ -42,54 +45,6 @@ RECREATE_WARNING = (
     "SERVER STARTED WITH recreate=True. Existing Acquirium data will be erased now. "
     "Restarting this server with recreate=True will erase data again."
 )
-
-
-def _aggregate_uri_label_rows(
-    rows: list,
-    seen: set[str],
-    kind: str,
-    concepts: list[dict[str, Any]],
-) -> None:
-    """Aggregate SPARQL (uri, label) rows into *concepts*, skipping already-seen URIs.
-
-    SPARQL row order is not stable across processes; sort labels and iterate
-    URIs in sorted order so the resulting concept dicts hash identically run
-    to run (otherwise the embedding cache misses every restart).
-    """
-    uri_labels: dict[str, set[str]] = {}
-    uri_first_label: dict[str, str | None] = {}
-    for row in rows:
-        uri = str(row[0]) if row[0] else None
-        label = str(row[1]).strip('"') if row[1] else None
-        if not uri:
-            continue
-        bucket = uri_labels.setdefault(uri, set())
-        if label:
-            bucket.add(label)
-
-    for uri in sorted(uri_labels):
-        if uri in seen:
-            continue
-        seen.add(uri)
-        labels = sorted(uri_labels[uri])
-        surfaces: list[str] = []
-        for lbl in labels:
-            lbl_lower = lbl.lower()
-            if lbl_lower not in surfaces:
-                surfaces.append(lbl_lower)
-        tokens = _split_local_name(uri)
-        if tokens:
-            joined = " ".join(tokens)
-            if joined not in surfaces:
-                surfaces.append(joined)
-        display_label = labels[0] if labels else (" ".join(tokens) if tokens else uri)
-        concepts.append({
-            "uri": uri,
-            "kind": kind,
-            "label": display_label,
-            "surfaces": surfaces,
-            "related": [],
-        })
 
 
 def pick_convertible_pair(from_candidates, to_candidates, are_compatible):
@@ -216,7 +171,7 @@ class Manager:
         # under embedding_cache/. See EmbeddingMatcher.
         self.exact_only = exact_only
 
-        _emb_model = os.getenv("ACQUIRIUM_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+        _emb_model = os.getenv("ACQUIRIUM_EMBEDDING_MODEL", DEFAULT_MODEL)
 
         # Persist the downloaded embedding model under the data dir so it
         # survives OS temp-dir purges (fastembed defaults to $TMPDIR). A
@@ -242,11 +197,15 @@ class Manager:
             name="qudt",
         )
 
+        # Units by typed expression; built with the QUDT index, no model needed.
+        self._unit_key_index: UnitKeyIndex | None = None
+
         # Single normalization façade, sharing the lazily-built converter.
         self._concept_resolver = ConceptResolver(
             graph_matcher=self._graph_matcher,
             qudt_matcher=self._qudt_matcher,
             converter_provider=self._ensure_qudt_converter,
+            unit_keys_provider=lambda: self._unit_key_index,
         )
 
         # Kept for backward compat — points to graph matcher
@@ -359,89 +318,28 @@ class Manager:
 
     # ----- Embedding index methods -----
 
-    def _extract_concepts_for_embedding(self, graph: "Graph") -> list[dict[str, Any]]:
-        """Extract class / predicate / substance concepts from *graph*.
+    def _extract_concepts_for_embedding(self, iris: list[str]) -> list[dict[str, Any]]:
+        """Extract class / predicate / substance / process / role concepts.
 
-        *graph* is the merged water + s223 vocabulary (read out of ontoenv,
-        imports not followed). Unit / quantity_kind concepts come separately
-        from the QUDT graphs via :class:`QUDTStore`.
+        The queries run over an in-memory Oxigraph copy of the union of the
+        ontology graphs named by *iris* (water + s223; imports not followed).
+        :class:`GraphConcepts` holds the queries and builds the concept dicts.
+        Unit / quantity_kind concepts come separately via :class:`QUDTStore`.
         """
         concepts: list[dict[str, Any]] = []
+        with timed_debug(logger, "graph embedding: copy %s", iris):
+            vocabulary = self.graph_store.copy_graphs(iris)
 
-        label_block_basic = f"""
-          OPTIONAL {{
-            {{ ?uri <{RDFS.label}> ?label . }}
-            UNION {{ ?uri <{SKOS.prefLabel}> ?label . }}
-            UNION {{ ?uri <{SKOS.altLabel}> ?label . }}
-            FILTER(LANG(?label) = "" || LANGMATCHES(LANG(?label), "en"))
-          }}
-        """
-
-        class_where = f"""
-          {{ ?uri a <{RDFS.Class}> . }}
-          UNION {{ ?uri a <{OWL_CLASS}> . }}
-          UNION {{ ?x <{RDFS.subClassOf}> ?uri . }}
-          UNION {{ ?x a ?uri . }}
-          UNION {{ ?uri a <{WATR.Class}> . }}
-          UNION {{ ?uri <{RDFS.subClassOf}> ?x . }}
-          UNION {{ ?x <{HAS_ENUMERATION_KIND}> ?uri . }}
-          UNION {{ ?x <{OF_SUBSTANCE}> ?uri . }}
-          UNION {{ ?x <{HAS_MEDIUM}> ?uri . }}
-          FILTER NOT EXISTS {{ ?uri (<{RDFS.subClassOf}>)* <{WATR.Process}> . }}
-          FILTER(!STRSTARTS(STR(?uri), "{WATR}Process"))
-        """
-        pred_where = f"""
-          {{ ?uri a <{RDF_PROP}> . }}
-          UNION {{ ?uri a <{OWL_OBJ_PROP}> . }}
-          UNION {{ ?uri a <{OWL_DATA_PROP}> . }}
-          UNION {{ ?s ?uri ?o . }}
-        """
-        # Constrained medium/substance space: the s223 substance enumeration
-        # and the NAWI water medium taxonomy, plus whatever the loaded model
-        # actually uses as a medium/substance (self-grounding so it's correct
-        # regardless of the imported s223 closure).
-        substance_where = f"""
-          {{ ?uri (<{RDFS.subClassOf}>)* <{S223['EnumerationKind-Substance']}> . }}
-          UNION {{ ?uri (<{RDFS.subClassOf}>)* <{WATR['Medium-Constituent']}> . }}
-          UNION {{ ?x <{S223.ofMedium}> ?uri . }}
-          UNION {{ ?x <{HAS_MEDIUM}> ?uri . }}
-          UNION {{ ?x <{OF_SUBSTANCE}> ?uri . }}
-        """
-        # Constrained process space: the NAWI process taxonomy plus whatever
-        # the loaded model actually uses as a process (self-grounding, like
-        # substances). Its own kind so process filters never rank equipment
-        # classes ("reverse osmosis" must hit Process-ReverseOsmosis, not
-        # ReverseOsmosisMembrane).
-        process_where = f"""
-          {{ ?uri (<{RDFS.subClassOf}>)* <{WATR.Process}> . }}
-          UNION {{ ?x <{WATR.hasProcess}> ?uri . }}
-          UNION {{ ?uri a <{WATR.Class}> . FILTER(STRSTARTS(STR(?uri), "{WATR}Process")) }}
-        """
-
-        extractions: list[tuple[str, str, str]] = [
-            ("class", class_where, label_block_basic),
-            ("predicate", pred_where, label_block_basic),
-            ("substance", substance_where, label_block_basic),
-            ("process", process_where, label_block_basic),
-        ]
-
-        for kind, where, label_block in extractions:
-            query = f"""
-            SELECT DISTINCT ?uri ?label WHERE {{
-              {where}
-              {label_block}
-              FILTER(isIRI(?uri))
-            }}
-            """
-            seen: set[str] = set()
+        for kind in GraphConcepts.KINDS:
             try:
                 with timed_debug(logger, "extract %s concepts (SPARQL)", kind):
-                    rows = list(graph.query(query))
+                    rows = select_values(vocabulary, GraphConcepts.concept_query(kind), iris)
                 logger.debug("extract %s: %d raw rows", kind, len(rows))
-                _aggregate_uri_label_rows(rows, seen, kind, concepts)
+                concepts += GraphConcepts.extract_concepts(rows, kind)
             except Exception:
                 logger.warning("Failed to extract %s concepts", kind, exc_info=True)
 
+        GraphConcepts.add_initialisms(concepts)
         logger.debug("_extract_concepts_for_embedding: %d total concepts", len(concepts))
         return concepts
 
@@ -464,9 +362,9 @@ class Manager:
     def _build_embedding_indexes(self) -> None:
         """Build both embedding indexes once from the static ontoenv graphs.
 
-        graph matcher <- water + s223 vocabularies merged (class / predicate
-        / substance); qudt matcher <- the QUDT unit + quantity_kind
-        vocabularies. Graphs are read out of ontoenv by IRI (owl:imports
+        graph matcher <- water + s223 vocabularies (class / predicate /
+        substance / process / role); qudt matcher <- the QUDT unit + quantity_kind
+        vocabularies. Both are queried in Oxigraph by graph IRI (owl:imports
         not followed); no inserted data is embedded.
 
         Runs the same way in exact-only mode — same concepts, same counts —
@@ -479,12 +377,7 @@ class Manager:
         self._update_embedding_status("graph", state="building")
         t0 = perf_counter()
         try:
-            with timed_debug(logger, "graph embedding: merge water+s223 named graphs"):
-                merged = Graph()
-                for iri in (WATER_IRI, S223_IRI):
-                    merged += self.graph_store.named_graph(iri)
-            logger.debug("graph embedding: merged %d triples", len(merged))
-            concepts = self._extract_concepts_for_embedding(merged)
+            concepts = self._extract_concepts_for_embedding([WATER_IRI, S223_IRI])
             if concepts:
                 with timed_debug(logger, "graph embedding: build_index n=%d", len(concepts)):
                     self._graph_matcher.build_index(concepts)
@@ -500,16 +393,17 @@ class Manager:
         t0 = perf_counter()
         try:
             qc: list[dict[str, Any]] = []
-            with timed_debug(logger, "qudt embedding: extract Unit concepts"):
-                qc += QUDTStore.extract_concepts(
-                    self.graph_store.named_graph(QUDT_UNIT_IRI), str(QUDT.Unit)
-                )
-            with timed_debug(logger, "qudt embedding: extract QuantityKind concepts"):
-                qc += QUDTStore.extract_concepts(
-                    self.graph_store.named_graph(QUDT_QK_IRI),
-                    str(QUDT.QuantityKind),
-                )
+            for iri, rdf_type in (
+                (QUDT_UNIT_IRI, str(QUDT.Unit)),
+                (QUDT_QK_IRI, str(QUDT.QuantityKind)),
+            ):
+                with timed_debug(logger, "qudt embedding: extract %s concepts", rdf_type):
+                    rows = self.graph_store.select_in_graphs(
+                        QUDTStore.concept_query(rdf_type), [iri]
+                    )
+                    qc += QUDTStore.extract_concepts(rows, rdf_type)
             logger.debug("qudt embedding: %d total concepts", len(qc))
+            self._unit_key_index = UnitKeyIndex([c for c in qc if c["kind"] == "unit"])
             if qc:
                 with timed_debug(logger, "qudt embedding: build_index n=%d", len(qc)):
                     self._qudt_matcher.build_index(qc)
@@ -877,12 +771,11 @@ class Manager:
             stream_count,
             source_id,
         )
-        ref_uri_map: dict[str, str] = {}
-        value_kind_map: dict[str, str] = {}
-        for name in df["ref_name"].unique().to_list():
-            ref_uri = str(compute_ref_uri(source_id, name))
-            ref_uri_map[name] = ref_uri
-            value_kind_map[name] = self._registered_value_kind(ref_uri)
+        ref_uri_map = {
+            name: str(compute_ref_uri(source_id, name)) for name in df["ref_name"].unique().to_list()
+        }
+        kinds = self._registered_value_kinds(ref_uri_map.values())
+        value_kind_map = {name: kinds[ref_uri] for name, ref_uri in ref_uri_map.items()}
         logger.debug("insert_timeseries_arrow source=%s unique_streams=%d", source_id, len(ref_uri_map))
         df = (
             df.with_columns([
@@ -917,22 +810,31 @@ class Manager:
         raise ValueError("deletion is not supported by incremental materialization")
 
     def _registered_value_kind(self, ref_uri: str) -> str:
-        value_kind = self.timeseries_store.stream_value_kind(ref_uri)
-        # Graph writes and Arrow ingestion may be issued back-to-back by a
-        # client. Ensure the derived stream registry has observed the graph
-        # write before rejecting the first data batch. The resync rebuilds the
-        # inferred graph, so only run it when the graph actually advanced since
-        # the last sync; otherwise repeated writes to an unregistered ref would
-        # each pay the full rebuild cost.
-        if value_kind is None:
+        return self._registered_value_kinds([ref_uri])[ref_uri]
+
+    def _registered_value_kinds(self, ref_uris: Iterable[str]) -> dict[str, str]:
+        """Normalised value kind of every stream in *ref_uris*; one store query per call.
+
+        Graph writes and Arrow ingestion may be issued back-to-back by a
+        client. Ensure the derived stream registry has observed the graph
+        write before rejecting the first data batch. The resync rebuilds the
+        inferred graph, so only run it when the graph actually advanced since
+        the last sync; otherwise repeated writes to an unregistered ref would
+        each pay the full rebuild cost.
+        """
+        wanted = list(dict.fromkeys(ref_uris))
+        kinds = self.timeseries_store.stream_value_kinds(wanted)
+        missing = [uri for uri in wanted if uri not in kinds]
+        if missing:
             published = int(self.graph_store.graph_status()["published_version"])
             if published != self._refs_synced_revision:
                 self._sync_stream_refs_from_graph()
                 self._refs_synced_revision = published
-            value_kind = self.timeseries_store.stream_value_kind(ref_uri)
-        if value_kind is None:
-            raise ValueError(f"stream {ref_uri} is not registered")
-        return normalize_value_kind(value_kind)
+            kinds.update(self.timeseries_store.stream_value_kinds(missing))
+            missing = [uri for uri in wanted if uri not in kinds]
+        if missing:
+            raise ValueError(f"stream {missing[0]} is not registered")
+        return {uri: normalize_value_kind(kinds[uri]) for uri in wanted}
 
     def insert_log(self, log_message: LogEntry):
         logger.debug("insert_log point_uri=%s ts=%s", log_message.point_uri, log_message.timestamp)
