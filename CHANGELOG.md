@@ -10,12 +10,167 @@ change in any release.
 
 ## [Unreleased]
 
+## [0.4.0a7] - 2026-09-14
+
+### Added
+- Read-only `acquirium app list` and `acquirium app inspect NAME` commands,
+  with JSON output and matching HTTP/Python APIs. Inspection includes declared
+  output schemas, units, settings, resolved streams, progress, and errors,
+  including deployments with no matches or planning failures.
+- `Query.context()`: from a measurement, the entity it is about, following a
+  named relation (`entity`, `upstream`, `downstream`, or one added with
+  `register_relation`). Points on pipes reach the equipment feeding them.
+- `max_depth=0` is unbounded on every edge form; `direction=` edges and
+  predicate lists compile to transitive property paths.
+- Incremental materialization apps on DuckDB and PostgreSQL/TimescaleDB.
+  Apps select streams with a semantic query and implement
+  `transform(inputs, output, context)`. Grouping is explicitly `per_match`
+  or `all_matches`; `aq.output.stream(...)` and `aq.output.named(...)`
+  select generated or explicit stream identities independently.
+- Correction-aware output replacement. Assigned output windows include removals
+  that propagate downstream. Complete buckets (`every`), trailing dependencies
+  (`lookback`), and leading dependencies (`lookahead`) determine which input
+  and output intervals are recomputed from the latest available readings.
+- One bounded materialization executor with per-binding failure isolation,
+  coherent database snapshots, transactional output/progress publication, and
+  active-generation checks. Long finite work ranges and explicit
+  `reprocess_app(name, start, end)` requests use durable cursors.
+- App deployment through `client.deploy_app(...)` or `[[apps]]` configuration.
+  Source definitions are validated before activation. Query-match changes
+  schedule retained output repair; code edits preserve progress and use explicit
+  reprocessing to update history.
+- App scheduling attributes `backfill`, `batch_delay`, and `min_interval`.
+  Durations accept `timedelta` or strings using `ms`, `s`, `m`, `h`, or `d`.
+- `StreamSet.in_unit(...)` for unit conversion and `aq.align(inputs)` for
+  resampling onto the app's declared clock. Stream descriptors, individual
+  matches, the full query result, and calculation windows are available to
+  transforms.
+- App checks through `client.check_app(...)` and
+  `acquirium app check module:Class`. The `--local` option executes in the
+  caller's terminal for debugging.
+- Derived stream metadata, generated labels, and producer selection through
+  `measurement(app="producer-name")`. The materialization DAG endpoint exposes
+  progress, execution status, and errors.
+
 ### Changed
-- File-driver configuration is centralized under `[[drivers]]`: `source_id`,
-  `watch_dir`, and `glob` are explicit and required. CSV/XLSX/Parquet layout is
-  also explicit; stream names are preserved exactly rather than sanitized.
-- Driver graph polling has its own cadence, independent of data ticks. Graph
-  content and graph-file insertion use separate APIs.
+- `measurement()` follows a fixed set of attach predicates (`hasProperty`,
+  directly or through a connection point, and `actuatedByProperty`), the
+  `entity` relation of `context()` read forwards, instead of any predicate.
+  Points a sensor `observes` are no longer returned for the sensor; they are
+  reached through the equipment or connection point that has them. The query
+  no longer scans the whole dataset (two seconds down to milliseconds on the
+  DPR model). A deployment attaching points by another predicate adds it with
+  `register_relation("entity", ...)`.
+- `measurement(direction=...)` searches the flow in places: the source's own
+  outlet (or inlet) connection points, then alternately the pipe and the next
+  entity with all of its connection points. `nearest` now defaults to `True`
+  with a direction, so each source keeps the first place holding a match and
+  filters walk past places without one; pass `nearest=False` for every point
+  within `max_depth`. The old form filtered the next entity's outlet or inlet
+  points only and skipped the source's own connection points.
+- `related(direction=..., nearest=True)` is supported the same way instead of
+  raising.
+- Preserve `insert_timeseries(..., replace=True)` ingestion compatibility on
+  DuckDB and TimescaleDB: replacement keeps exactly the supplied rows, including
+  clearing with an empty list or inserting into an unwritten stream. One revision
+  atomically records the physical replacement and a durable stream reset.
+  Downstream apps fully rebuild and propagate resets without retaining deleted
+  timestamps for replacement. Ordinary upserts retain omitted timestamps.
+  Reset rebuilds supersede pending backfills atomically and retry after failure
+  or restart; they load full inputs and can require more time and memory.
+
+## [0.4.0a6] - 2026-09-09
+
+### Changed
+- **Timescale timeseries keyed by integer `ref_id`**, matching the DuckDB
+  backend. A new `ref_ids` table maps reference URIs to ids; the unique index
+  and compression `segmentby` use `ref_id`, and the `timeseries_streams` view
+  joins the URI back in. A store whose `timeseries` table is still keyed by
+  `ref_uri` is refused at startup; recreate it.
+- **One Timescale write path.** Rows become a Polars frame, are COPYed into a
+  temporary staging table on the store's own connection, and one
+  `INSERT ... SELECT ... ON CONFLICT` merges them into the hypertable, all in a
+  single transaction. `upsert_rows` and `replace_rows` both route through it,
+  so replace is atomic and the `executemany` loop is gone. The merge input is
+  sorted by `(ref_id, ts)` so inserts stay sequential per stream.
+- The Timescale hypertable is created without the default `ts` index; every
+  store query filters by `ref_id` first, which the unique `(ref_id, ts)` index
+  serves. Existing stores keep the old index until recreated or dropped by
+  hand.
+- `AcquiriumClient` owns one `requests.Session`, so consecutive calls reuse
+  the TCP connection instead of opening a new one per request. The Arrow
+  streaming reads drain the response to end of stream so the connection
+  returns to the pool.
+- The client, the `[driver]` self-connect default, the CLI fallback, and the
+  shipped `acquirium.toml` files use `127.0.0.1` instead of `localhost` as the
+  server host.
+- `Manager.timescale` is renamed `Manager.timeseries_store`; it holds
+  whichever timeseries backend is configured.
+
+### Fixed
+- Windows clients paid about 2 s per request against a local server (#85).
+  The server listens on IPv4 only and `localhost` resolves to `::1` first;
+  Windows refuses that connection only after ~2 s, and every request opened a
+  new connection. The session reuse and the `127.0.0.1` default above remove
+  both halves. Configs that set `server_url = "localhost"` explicitly should
+  switch to `127.0.0.1` on Windows.
+- `watertap_build_spec` with a Windows file path (`C:\path\build.py:fn`) was
+  split at the drive-letter colon and failed to import a module named `C`.
+
+### Removed
+- The `adbc-driver-postgresql` dependency. The Timescale write path COPYs into
+  a staging table on the store's own psycopg connection and no longer needs
+  it.
+
+## [0.4.0a5] - 2026-09-02
+
+### Added
+- **Exact-only text resolution.** `[server] exact_only = true` (or
+  `ACQUIRIUM_EXACT_ONLY=true`) builds the graph and QUDT concept indexes
+  without embedding them. Exact matches on names, units, and symbols keep
+  resolving; fuzzy text resolves to nothing. No embedding model is downloaded
+  or loaded, and nothing is written under `embedding_cache/`, so a server can
+  start offline and without the FastEmbed weights.
+- `GET /embeddings/status` gains a top-level `semantic` flag, `false` in
+  exact-only mode. Both indexes still report `ready` there.
+
+### Changed
+- Client-side QUDT resolution (`unit`, `quantity_kind`, and similar fields on
+  registration) skips a value that does not resolve, with a warning, instead
+  of storing the raw text as a literal.
+- Text matcher log lines are prefixed with the index name (`[graph]`,
+  `[qudt]`) so the two matchers can be told apart in the server log.
+
+## [0.4.0a4] - 2026-09-01
+
+### Fixed
+- Dependency bounds. `pyshifty`, `pyontoenv`, `numpy`, and `ipykernel` were
+  declared as either exact pins or open-ended ranges. Published releases
+  carried `pyshifty>=0.3.0`, so a fresh `pip install acquirium` pulled
+  pyshifty 0.4.x, whose API change crashed the server at startup. All four
+  now use compatible-release ranges (`pyshifty>=0.3.0,<0.4`,
+  `pyontoenv>=0.6.0,<0.7`, `numpy>=2.3,<3`, `ipykernel>=7.0.1,<8`), so new
+  installs stay on tested majors without forcing exact versions on
+  downstream environments.
+
+## [0.4.0a3] - 2026-08-30
+
+### Fixed
+- CSV ingestion no longer types columns from a 100-row sample; every cell is
+  read as text (values were cast to text downstream regardless). Files where a
+  numeric column carries a status word (`LOW`, `OK`) past the sample window, or
+  holds `0` for hundreds of rows before its first decimal reading, previously
+  failed to read.
+- `Query.metadata()` (explore and `Q`) infers its result-table column types
+  from all rows. A sparse column — a point label bound on few rows — was
+  previously typed from the first 100 rows and the first real value failed the
+  build.
+
+### Removed
+- The `infer_schema_length` CSV driver key: with every cell read as text it
+  has no effect.
+
+## [0.4.0a2] - 2026-08-27
 
 ### Added
 - **Explicit driver-author contract.** Ingest drivers declare streams with
@@ -27,6 +182,52 @@ change in any release.
   native/ISO/common timestamp parsing, split date/time columns, Unix epochs,
   timezone handling, conservative column-name discovery, and explicit
   `date_format` / `day_first` controls.
+- `CSVIngestDriver` customization hooks: `prepare_frame(df, path)` runs on the
+  raw frame before reshaping and `declare_stream(ref_name)` attaches metadata
+  per discovered stream. New config keys `null_values` and
+  `infer_schema_length` pass through to the CSV reader.
+- **Point labels in displays.** Placeholder points minted at registration get
+  a default `rdfs:label` (`<source_id>__<ref_name>`); explore queries fetch
+  each data node's label, `DataObject.metadata()` gains a `point_label`
+  column, `Query.metadata()` shows `<alias>.label` columns, and wide
+  dataframe columns use the label instead of the URI where it is unique.
+- Explore query aliases are checked for uniqueness: duplicate explicit
+  aliases raise, derived aliases are uniquified.
+- Documentation reorganized into tutorials, how-to guides, reference, and
+  explanation (`docs/_index.md`), with a query cookbook and driver tutorials.
+
+### Changed
+- File-driver configuration is centralized under `[[drivers]]`: `source_id`,
+  `watch_dir`, and `glob` are explicit and required. CSV/XLSX/Parquet layout is
+  also explicit; stream names are preserved exactly rather than sanitized.
+- Driver graph polling has its own cadence, independent of data ticks. Graph
+  content and graph-file insertion use separate APIs.
+- **Stream registration checks point metadata.** `register_streams()` and
+  `resolve_point_metadata()` now live on `AcquiriumClient` (the `Acquirium`
+  facade delegates). A stream registered against an existing `point_uri` is
+  checked against the graph: missing metadata fields are added, conflicting
+  values raise `ValueError` before anything is inserted. A stream without a
+  `point_uri` mints a placeholder point (`<ref_uri>__point`); a stream with
+  neither `point_uri` nor `ref_name` is rejected.
+- A stream unit that differs from its point's unit is accepted when the server
+  reports the two convertible; it is recorded on the external reference as the
+  storage unit and converted on read. Unconvertible units still raise.
+- `Query.dataframe()` and `DataObject.dataframe()` share
+  `shape/start/end/limit/order/include_ref/compact` with identical defaults
+  (`"wide"`, `compact=True`), so `q.dataframe(...)` equals
+  `q.data(...).dataframe(...)`. On `DataObject` the window applies client-side
+  to the fetched frame.
+
+### Fixed
+- Warm start re-registers any bundled ontology (water, s223, QUDT quantity
+  kinds, ref-schema) missing from an existing store instead of skipping
+  registration whenever the store held any graph.
+- Concurrent `/resolve_record` and `insert_graph` calls could deadlock the
+  server on ontoenv's store-backed graph view (GIL/mutex inversion).
+  `named_graph()` now returns a cached in-memory copy built under the store
+  lock.
+- The explore query cache key distinguishes queries run with and without
+  ontology dependencies.
 
 ### Removed
 - **Breaking:** `TabularIngestBase`, implicit per-file datasource identity,
@@ -299,7 +500,13 @@ change in any release.
 - Text matcher backed by FastEmbed with QUDT and graph indexes.
 - Grafana dashboard helpers.
 
-[Unreleased]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a1...HEAD
+[Unreleased]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a7...HEAD
+[0.4.0a7]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a6...v0.4.0a7
+[0.4.0a6]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a5...v0.4.0a6
+[0.4.0a5]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a4...v0.4.0a5
+[0.4.0a4]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a3...v0.4.0a4
+[0.4.0a3]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a2...v0.4.0a3
+[0.4.0a2]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a1...v0.4.0a2
 [0.4.0a1]: https://github.com/DataDrivenCPS/acquirium/compare/v0.4.0a0...v0.4.0a1
 [0.4.0a0]: https://github.com/DataDrivenCPS/acquirium/compare/v0.3.1...v0.4.0a0
 [0.3.1]: https://github.com/DataDrivenCPS/acquirium/compare/v0.3.0...v0.3.1
